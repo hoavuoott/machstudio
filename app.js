@@ -8,7 +8,8 @@ const names = {
   drums: ['Trống', '#f6a980'], bass: ['Bass', '#83dfcb'], other: ['Nhạc cụ', '#9db8ff']
 };
 const state = {
-  tracks: [], history: [], position: 0, speed: 1, playback: null,
+  tracks: [], history: [], future: [], position: 0, speed: 1, playback: null,
+  view: null, loop: false,
   busy: false, cached: false, modelFile: null
 };
 let context, decoder, fileName, original, worker, pending, download;
@@ -24,7 +25,26 @@ const decode = bytes => {
   return decoder.decodeAudioData(bytes);
 };
 function time(seconds) {
-  return Math.floor(seconds / 60) + ':' + String(Math.floor(seconds % 60)).padStart(2, '0');
+  const tenths = Math.floor(seconds * 10);
+  return Math.floor(tenths / 600) + ':' + String(Math.floor(tenths / 10) % 60).padStart(2, '0') + '.' + tenths % 10;
+}
+const viewRange = () => state.view ?? [0, duration()];
+function selection() {
+  if (!$('in').value || !$('out').value) return null;
+  const start = Number($('in').value), end = Math.min(duration(), Number($('out').value));
+  return start >= 0 && end > start ? [start, end] : null;
+}
+function refreshSelection() {
+  const range = selection();
+  const [start, end] = viewRange();
+  const width = end - start || 1;
+  const percent = t => Math.max(0, Math.min(100, (t - start) / width * 100));
+  $('tracks').style.setProperty('--selection-start', (range ? percent(range[0]) : 0) + '%');
+  $('tracks').style.setProperty('--selection-end', (range ? 100 - percent(range[1]) : 100) + '%');
+  for (const id of ['loop','zoomRange','keep','cut','fadeIn','fadeOut']) $(id).disabled = !range;
+  $('zoomAll').disabled = !state.view;
+  if (!range) state.loop = false;
+  $('loop').setAttribute('aria-pressed', state.loop);
 }
 function setBusy(busy) {
   state.busy = busy;
@@ -49,26 +69,39 @@ function redraw(resetRange = false) {
   }
   $('preset').disabled = state.tracks.length < 2;
   $('undo').disabled = !state.history.length;
+  $('redo').disabled = !state.future.length;
   $('seek').max = duration();
   $('in').max = $('out').max = duration();
   if (resetRange) {
+    state.view = null;
+    state.loop = false;
     $('in').value = 0;
     $('out').value = duration().toFixed(3);
   }
   $('tracks').replaceChildren(...state.tracks.map(renderTrack));
+  const [start, end] = viewRange();
+  $('ruler').hidden = !hasTracks;
+  $('ruler').replaceChildren(...Array.from({ length: 5 }, (_, index) => {
+    const tick = document.createElement('span');
+    tick.textContent = time(start + (end - start) * index / 4);
+    return tick;
+  }));
   if (!hasTracks) {
     const placeholder = document.createElement('p');
     placeholder.className = 'empty';
     placeholder.textContent = 'Chọn bài nhạc để xem waveform.';
     $('tracks').append(placeholder);
   }
+  refreshSelection();
   drawPosition(state.position);
 }
 function drawPosition(position) {
   const length = duration();
   $('seek').value = position;
   $('time').value = time(position) + ' / ' + time(length);
-  $('tracks').style.setProperty('--cursor', (length ? position / length * 100 : 0) + '%');
+  const [start, end] = viewRange();
+  const visible = position >= start && position <= end && end > start;
+  $('tracks').style.setProperty('--cursor', (visible ? (position - start) / (end - start) * 100 : -1) + '%');
 }
 function renderTrack(track) {
   const row = $('track').content.firstElementChild.cloneNode(true);
@@ -78,18 +111,51 @@ function renderTrack(track) {
   const canvas = row.querySelector('canvas');
   const pen = canvas.getContext('2d');
   const data = track.buffer.getChannelData(0);
+  const [viewStart, viewEnd] = viewRange();
+  const firstFrame = Math.min(data.length - 1, Math.floor(viewStart * track.buffer.sampleRate));
+  const span = Math.max(1, Math.min(data.length, Math.ceil(viewEnd * track.buffer.sampleRate)) - firstFrame);
   pen.strokeStyle = color;
   pen.beginPath();
   for (let x = 0; x < canvas.width; x++) {
-    const start = Math.floor(x / canvas.width * data.length);
-    const end = Math.max(start + 1, Math.floor((x + 1) / canvas.width * data.length));
+    const start = firstFrame + Math.floor(x / canvas.width * span);
+    const end = Math.max(start + 1, firstFrame + Math.floor((x + 1) / canvas.width * span));
     let peak = 0;
     for (let i = start; i < end; i++) peak = Math.max(peak, Math.abs(data[i]));
     pen.moveTo(x, 34 - peak * 32);
     pen.lineTo(x, 35 + peak * 32);
   }
   pen.stroke();
-  canvas.onclick = event => seek(event.offsetX / canvas.clientWidth * duration());
+  let drag;
+  function pointerTime(event) {
+    const bounds = canvas.getBoundingClientRect();
+    const fraction = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
+    return viewStart + fraction * (viewEnd - viewStart);
+  }
+  function selectTo(event) {
+    const end = pointerTime(event);
+    $('in').value = Math.min(drag.time, end).toFixed(3);
+    $('out').value = Math.max(drag.time, end).toFixed(3);
+    refreshSelection();
+  }
+  canvas.onpointerdown = event => {
+    if (!event.isPrimary || event.button !== 0) return;
+    drag = { x: event.clientX, time: pointerTime(event), moved: false };
+    canvas.setPointerCapture(event.pointerId);
+  };
+  canvas.onpointermove = event => {
+    if (!drag || !event.isPrimary) return;
+    drag.moved ||= Math.abs(event.clientX - drag.x) > 4;
+    if (drag.moved) selectTo(event);
+  };
+  canvas.onpointerup = event => {
+    if (!drag || !event.isPrimary) return;
+    if (drag.moved) {
+      selectTo(event);
+      seek(Number($('in').value));
+    } else seek(pointerTime(event));
+    drag = null;
+  };
+  canvas.onlostpointercapture = () => { drag = null; };
   for (const control of row.querySelectorAll('[data-track]')) {
     const prop = control.dataset.track;
     control.setAttribute('aria-label', (control.closest('label')?.textContent.trim() || control.textContent) + ' ' + label);
@@ -133,12 +199,18 @@ function setMix(voices, tracks, isolated = false) {
 function updateMix() {
   if (state.playback) setMix(state.playback.voices, state.tracks);
 }
+function playbackPosition(job) {
+  const elapsed = job.start === null ? 0 : Math.max(0, context.currentTime - job.start) * job.speed;
+  const position = job.offset + elapsed;
+  if (!job.loop || position < job.loop[1]) return position;
+  const [start, end] = job.loop;
+  return start + (position - start) % (end - start);
+}
 function pause(reset = false) {
   const job = state.playback;
   state.playback = null;
   if (job) {
-    const elapsed = job.start === null ? 0 : Math.max(0, context.currentTime - job.start);
-    state.position = Math.min(duration(), job.offset + elapsed * job.speed);
+    state.position = Math.min(duration(), playbackPosition(job));
     context.removeEventListener('statechange', job.onStateChange);
     for (const { source, filter, pan, gain, started } of job.voices) {
       if (started) source.stop();
@@ -161,8 +233,10 @@ async function play() {
   output.connect(ctx.destination);
   const voices = state.tracks.map(track => connect(ctx, track, state.speed, output));
   setMix(voices, state.tracks);
+  const loop = state.loop ? selection() : null;
+  if (loop && (state.position < loop[0] || state.position >= loop[1])) state.position = loop[0];
   const job = {
-    voices, output, start: null, offset: state.position, speed: state.speed,
+    voices, output, start: null, offset: state.position, speed: state.speed, loop,
     onStateChange() {
       if (state.playback === job && ctx.state !== 'running') {
         pause();
@@ -177,6 +251,10 @@ async function play() {
     if (state.playback !== job) return;
     job.start = ctx.currentTime + 0.05;
     for (const voice of voices) {
+      if (loop) {
+        voice.source.loop = true;
+        [voice.source.loopStart, voice.source.loopEnd] = loop;
+      }
       voice.source.start(job.start, job.offset);
       voice.started = true;
     }
@@ -191,7 +269,7 @@ async function play() {
   }
   function tick() {
     if (state.playback !== job) return;
-    const position = job.offset + Math.max(0, ctx.currentTime - job.start) * job.speed;
+    const position = playbackPosition(job);
     if (position >= duration()) return pause(true);
     drawPosition(position);
     requestAnimationFrame(tick);
@@ -222,7 +300,13 @@ function rangeEdit(kind) {
       for (let ch = 0; ch < old.numberOfChannels; ch++) {
         const input = old.getChannelData(ch);
         const output = next.getChannelData(ch);
-        if (kind === 'reverse') {
+        if (kind === 'fadeIn' || kind === 'fadeOut') {
+          output.set(input);
+          for (let i = start; i < end; i++) {
+            const fraction = (i - start) / Math.max(1, end - start - 1);
+            output[i] *= kind === 'fadeIn' ? fraction : 1 - fraction;
+          }
+        } else if (kind === 'reverse') {
           output.set(input);
           output.reverse();
         } else if (kind === 'keep') {
@@ -237,6 +321,7 @@ function rangeEdit(kind) {
   } catch (error) { return status('Không thể chỉnh đoạn: ' + error.message); }
   state.history.push(state.tracks);
   if (state.history.length > 5) state.history.shift();
+  state.future = [];
   state.tracks = edited;
   redraw(true);
   status('');
@@ -361,6 +446,7 @@ $('split').onclick = async () => {
     });
     pause(true);
     state.history = [];
+    state.future = [];
     state.tracks = tracks;
     $('preset').value = 'mix';
     redraw(true);
@@ -397,6 +483,7 @@ $('file').onchange = async event => {
     $('fileInfo').textContent = time(decoded.duration) + ' · ' + (decoded.numberOfChannels === 1 ? 'Mono' : 'Stereo');
     state.speed = 1;
     state.history = [];
+    state.future = [];
     $('speed').value = '1';
     $('preset').value = 'mix';
     state.tracks = [newTrack('original', original)];
@@ -443,13 +530,42 @@ $('preset').onchange = event => {
 $('keep').onclick = () => rangeEdit('keep');
 $('cut').onclick = () => rangeEdit('cut');
 $('reverse').onclick = () => rangeEdit('reverse');
-$('undo').onclick = () => {
-  if (!state.history.length) return;
+$('fadeIn').onclick = () => rangeEdit('fadeIn');
+$('fadeOut').onclick = () => rangeEdit('fadeOut');
+function restoreEdit(from, to) {
+  if (!from.length) return;
   pause(true);
   const current = state.tracks;
-  state.tracks = state.history.pop().map((track, index) => ({ ...current[index], buffer: track.buffer }));
+  to.push(current);
+  state.tracks = from.pop().map((track, index) => ({ ...current[index], buffer: track.buffer }));
   redraw(true);
   status('');
+}
+$('undo').onclick = () => restoreEdit(state.history, state.future);
+$('redo').onclick = () => restoreEdit(state.future, state.history);
+$('loop').onclick = () => {
+  state.loop = !state.loop;
+  refreshSelection();
+  if (state.playback) seek(playbackPosition(state.playback));
 };
+$('zoomRange').onclick = () => { state.view = selection(); redraw(); };
+$('zoomAll').onclick = () => { state.view = null; redraw(); };
+for (const id of ['in', 'out']) {
+  $(id).oninput = refreshSelection;
+  $(id).onchange = () => {
+    if (state.playback && (state.loop || state.playback.loop)) seek(playbackPosition(state.playback));
+  };
+}
+document.addEventListener('keydown', event => {
+  if (event.repeat || event.target.closest('input, select, button, [contenteditable]') || $('consent').open) return;
+  if (event.code === 'Space' && duration() && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    event.preventDefault();
+    $('play').click();
+  }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+    event.preventDefault();
+    $(event.shiftKey ? 'redo' : 'undo').click();
+  }
+});
 $('export').onclick = () => exportAudio(state.tracks, 'mix');
 void showModel();
