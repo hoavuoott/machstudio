@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mạch Studio — Chỉnh nhạc trên máy</title>
-<link rel="stylesheet" href="./style.css">
-<script type="module" src="./app.js"></script>
+<link rel="stylesheet" href="./style.css?v=0.1.1">
+<script type="module" src="./app.js?v=0.1.1"></script>
 </head>
 <body>
 <header><div class="brand"><span class="mark" aria-hidden="true">▥</span> Mạch Studio</div><span class="local">● Xử lý trên thiết bị</span></header>
@@ -34,6 +34,7 @@
 </section>
 <section class="panel model"><div><h2>Mô hình AI</h2><p id="modelStatus">Đang kiểm tra bộ nhớ…</p></div><div class="actions"><label class="button">Chọn file ONNX<input id="modelFile" type="file" accept=".onnx" hidden></label><button id="clear" disabled>Xóa mô hình đã lưu</button></div></section>
 </main>
+<footer class="site-version">Mạch Studio · Phiên bản 0.1.1</footer>
 <dialog id="consent"><form method="dialog"><h2>Tải và lưu mô hình AI?</h2><p>HTDemucs cần tải khoảng 175 MB. Trình duyệt sẽ lưu mô hình trên thiết bị để dùng lại. Bài nhạc được xử lý ngay trên máy.</p><p>Dành cho sử dụng cá nhân và nghiên cứu.</p><div class="actions"><button value="cancel" autofocus>Để sau</button><button class="primary" value="accept">Đồng ý tải và lưu</button></div></form></dialog>
 <template id="track"><article class="track"><div class="track-name"></div><div class="wave"><canvas width="960" height="68"></canvas><i></i></div><div class="mix"><button type="button" data-track="mute">Mute</button><button type="button" data-track="solo">Solo</button><label>Âm lượng <input data-track="gain" type="range" min="0" max="1.6" step=".01" value="1"></label><label>Pan <input data-track="pan" type="range" min="-1" max="1" step=".01" value="0"></label><label>EQ <input data-track="eq" type="range" min="-12" max="12" step="1" value="0"></label><button type="button" data-track="wav">WAV</button></div></article></template>
 </body></html>
