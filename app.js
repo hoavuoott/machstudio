@@ -11,12 +11,18 @@ const state = {
   tracks: [], history: [], position: 0, speed: 1, playback: null,
   busy: false, cached: false, modelFile: null
 };
-let context, fileName, original, worker, pending, download;
+let context, decoder, fileName, original, worker, pending, download;
 let cancelled = false;
 const status = message => { $('status').textContent = message; };
 const duration = () => state.tracks[0]?.buffer.duration ?? 0;
 const cache = () => caches.open(cacheName);
-const audio = () => context ??= new AudioContext({ sampleRate: rate });
+// Demucs needs 44.1 kHz input. Let the live context use the output device's
+// preferred rate and let Web Audio resample the tracks for playback.
+const audio = () => context ??= new AudioContext({ latencyHint: 'playback' });
+const decode = bytes => {
+  decoder ??= new OfflineAudioContext(2, 1, rate);
+  return decoder.decodeAudioData(bytes);
+};
 function time(seconds) {
   return Math.floor(seconds / 60) + ':' + String(Math.floor(seconds % 60)).padStart(2, '0');
 }
@@ -103,7 +109,7 @@ function renderTrack(track) {
   }
   return row;
 }
-function connect(ctx, track, speed) {
+function connect(ctx, track, speed, destination = ctx.destination) {
   const source = ctx.createBufferSource();
   const filter = ctx.createBiquadFilter();
   const pan = ctx.createStereoPanner();
@@ -112,7 +118,7 @@ function connect(ctx, track, speed) {
   source.playbackRate.value = speed;
   filter.type = track.key === 'bass' ? 'lowshelf' : 'highshelf';
   filter.frequency.value = track.key === 'bass' ? 180 : 2400;
-  source.connect(filter).connect(pan).connect(gain).connect(ctx.destination);
+  source.connect(filter).connect(pan).connect(gain).connect(destination);
   return { source, filter, pan, gain, track };
 }
 function setMix(voices, tracks, isolated = false) {
@@ -131,30 +137,58 @@ function pause(reset = false) {
   const job = state.playback;
   state.playback = null;
   if (job) {
-    state.position = Math.min(duration(), job.offset + Math.max(0, context.currentTime - job.start) * job.speed);
-    for (const { source, filter, pan, gain } of job.voices) {
-      source.stop();
+    const elapsed = job.start === null ? 0 : Math.max(0, context.currentTime - job.start);
+    state.position = Math.min(duration(), job.offset + elapsed * job.speed);
+    context.removeEventListener('statechange', job.onStateChange);
+    for (const { source, filter, pan, gain, started } of job.voices) {
+      if (started) source.stop();
       source.disconnect();
       filter.disconnect();
       pan.disconnect();
       gain.disconnect();
     }
+    job.output.disconnect();
   }
   if (reset) state.position = 0;
   $('play').textContent = 'Phát';
   drawPosition(state.position);
 }
-function play() {
+async function play() {
   if (!duration() || state.playback) return;
   if (state.position >= duration()) state.position = 0;
   const ctx = audio();
-  void ctx.resume().catch(error => { pause(); status(error.message); });
-  const voices = state.tracks.map(track => connect(ctx, track, state.speed));
+  const output = ctx.createGain();
+  output.connect(ctx.destination);
+  const voices = state.tracks.map(track => connect(ctx, track, state.speed, output));
   setMix(voices, state.tracks);
-  const job = { voices, start: ctx.currentTime + 0.025, offset: state.position, speed: state.speed };
+  const job = {
+    voices, output, start: null, offset: state.position, speed: state.speed,
+    onStateChange() {
+      if (state.playback === job && ctx.state !== 'running') {
+        pause();
+        status('Thiết bị âm thanh đã tạm dừng. Bấm Phát để tiếp tục.');
+      }
+    }
+  };
   state.playback = job;
-  for (const { source } of voices) source.start(job.start, job.offset);
   $('play').textContent = 'Tạm dừng';
+  try {
+    await ctx.resume();
+    if (state.playback !== job) return;
+    job.start = ctx.currentTime + 0.05;
+    for (const voice of voices) {
+      voice.source.start(job.start, job.offset);
+      voice.started = true;
+    }
+    ctx.addEventListener('statechange', job.onStateChange);
+    if (ctx.state !== 'running') return job.onStateChange();
+    if ($('status').textContent.startsWith('Thiết bị âm thanh đã tạm dừng.')) status('');
+  } catch (error) {
+    if (state.playback !== job) return;
+    pause();
+    status('Không thể phát âm thanh: ' + error.message);
+    return;
+  }
   function tick() {
     if (state.playback !== job) return;
     const position = job.offset + Math.max(0, ctx.currentTime - job.start) * job.speed;
@@ -317,7 +351,12 @@ $('split').onclick = async () => {
     const tracks = ['vocals','drums','bass','other'].map(key => {
       const { channelData, sampleRate } = stems[key];
       const buffer = audio().createBuffer(channelData.length, channelData[0].length, sampleRate);
-      channelData.forEach((channel, index) => buffer.copyToChannel(channel, index));
+      channelData.forEach((channel, index) => {
+        for (let i = 0; i < channel.length; i++) {
+          if (!Number.isFinite(channel[i])) channel[i] = 0;
+        }
+        buffer.copyToChannel(channel, index);
+      });
       return newTrack(key, buffer);
     });
     pause(true);
@@ -350,7 +389,7 @@ $('file').onchange = async event => {
   setBusy(true);
   status('Đang đọc bài nhạc…');
   try {
-    const decoded = await audio().decodeAudioData(await file.arrayBuffer());
+    const decoded = await decode(await file.arrayBuffer());
     pause(true);
     fileName = file.name.replace(/\.[^.]+$/, '');
     original = decoded;
