@@ -1,0 +1,416 @@
+const $ = id => document.getElementById(id);
+const modelUrl = 'https://bakkot.github.io/demucs-js/htdemucs.onnx';
+const modelKey = new URL('./models/htdemucs-v4.onnx', location.href).href;
+const cacheName = 'mach-studio-models-v1';
+const rate = 44100;
+const names = {
+  original: ['Bản gốc', '#c9b7ff'], vocals: ['Vocal', '#d1aeff'],
+  drums: ['Trống', '#f6a980'], bass: ['Bass', '#83dfcb'], other: ['Nhạc cụ', '#9db8ff']
+};
+const state = {
+  tracks: [], history: [], position: 0, speed: 1, playback: null,
+  busy: false, cached: false, modelFile: null
+};
+let context, fileName, original, worker, pending, download;
+let cancelled = false;
+const status = message => { $('status').textContent = message; };
+const duration = () => state.tracks[0]?.buffer.duration ?? 0;
+const cache = () => caches.open(cacheName);
+const audio = () => context ??= new AudioContext({ sampleRate: rate });
+function time(seconds) {
+  return Math.floor(seconds / 60) + ':' + String(Math.floor(seconds % 60)).padStart(2, '0');
+}
+function setBusy(busy) {
+  state.busy = busy;
+  $('file').disabled = $('modelFile').disabled = busy;
+  $('split').disabled = busy || !original;
+  $('clear').disabled = busy || (!state.cached && !state.modelFile);
+}
+async function showModel() {
+  state.cached = Boolean(await cache().then(store => store.match(modelKey)).catch(() => null));
+  $('modelStatus').textContent = state.modelFile
+    ? 'Đang dùng ' + state.modelFile.name
+    : state.cached ? 'Đã lưu HTDemucs trên thiết bị' : 'Chưa tải HTDemucs · khoảng 175 MB';
+  setBusy(state.busy);
+}
+function newTrack(key, buffer) {
+  return { key, buffer, gain: 1, pan: 0, eq: 0, mute: false, solo: false };
+}
+function redraw(resetRange = false) {
+  const hasTracks = Boolean(duration());
+  for (const id of ['play','stop','speed','reverse','export','seek','in','out','keep','cut']) {
+    $(id).disabled = !hasTracks;
+  }
+  $('preset').disabled = state.tracks.length < 2;
+  $('undo').disabled = !state.history.length;
+  $('seek').max = duration();
+  $('in').max = $('out').max = duration();
+  if (resetRange) {
+    $('in').value = 0;
+    $('out').value = duration().toFixed(3);
+  }
+  $('tracks').replaceChildren(...state.tracks.map(renderTrack));
+  if (!hasTracks) {
+    const placeholder = document.createElement('p');
+    placeholder.className = 'empty';
+    placeholder.textContent = 'Chọn bài nhạc để xem waveform.';
+    $('tracks').append(placeholder);
+  }
+  drawPosition(state.position);
+}
+function drawPosition(position) {
+  const length = duration();
+  $('seek').value = position;
+  $('time').value = time(position) + ' / ' + time(length);
+  $('tracks').style.setProperty('--cursor', (length ? position / length * 100 : 0) + '%');
+}
+function renderTrack(track) {
+  const row = $('track').content.firstElementChild.cloneNode(true);
+  const [label, color] = names[track.key];
+  row.style.setProperty('--track', color);
+  row.querySelector('.track-name').textContent = label;
+  const canvas = row.querySelector('canvas');
+  const pen = canvas.getContext('2d');
+  const data = track.buffer.getChannelData(0);
+  pen.strokeStyle = color;
+  pen.beginPath();
+  for (let x = 0; x < canvas.width; x++) {
+    const start = Math.floor(x / canvas.width * data.length);
+    const end = Math.max(start + 1, Math.floor((x + 1) / canvas.width * data.length));
+    let peak = 0;
+    for (let i = start; i < end; i++) peak = Math.max(peak, Math.abs(data[i]));
+    pen.moveTo(x, 34 - peak * 32);
+    pen.lineTo(x, 35 + peak * 32);
+  }
+  pen.stroke();
+  canvas.onclick = event => seek(event.offsetX / canvas.clientWidth * duration());
+  for (const control of row.querySelectorAll('[data-track]')) {
+    const prop = control.dataset.track;
+    control.setAttribute('aria-label', (control.closest('label')?.textContent.trim() || control.textContent) + ' ' + label);
+    if (prop === 'wav') {
+      control.onclick = () => exportAudio([track], track.key, true);
+    } else if (control.tagName === 'BUTTON') {
+      control.setAttribute('aria-pressed', track[prop]);
+      control.onclick = () => {
+        track[prop] = !track[prop];
+        control.setAttribute('aria-pressed', track[prop]);
+        updateMix();
+      };
+    } else {
+      control.value = track[prop];
+      control.oninput = () => { track[prop] = Number(control.value); updateMix(); };
+    }
+  }
+  return row;
+}
+function connect(ctx, track, speed) {
+  const source = ctx.createBufferSource();
+  const filter = ctx.createBiquadFilter();
+  const pan = ctx.createStereoPanner();
+  const gain = ctx.createGain();
+  source.buffer = track.buffer;
+  source.playbackRate.value = speed;
+  filter.type = track.key === 'bass' ? 'lowshelf' : 'highshelf';
+  filter.frequency.value = track.key === 'bass' ? 180 : 2400;
+  source.connect(filter).connect(pan).connect(gain).connect(ctx.destination);
+  return { source, filter, pan, gain, track };
+}
+function setMix(voices, tracks, isolated = false) {
+  const solo = !isolated && tracks.some(track => track.solo);
+  for (const { track, gain, filter, pan } of voices) {
+    const audible = isolated || (!track.mute && (!solo || track.solo));
+    gain.gain.value = audible ? track.gain : 0;
+    filter.gain.value = track.eq;
+    pan.pan.value = track.pan;
+  }
+}
+function updateMix() {
+  if (state.playback) setMix(state.playback.voices, state.tracks);
+}
+function pause(reset = false) {
+  const job = state.playback;
+  state.playback = null;
+  if (job) {
+    state.position = Math.min(duration(), job.offset + Math.max(0, context.currentTime - job.start) * job.speed);
+    for (const { source, filter, pan, gain } of job.voices) {
+      source.stop();
+      source.disconnect();
+      filter.disconnect();
+      pan.disconnect();
+      gain.disconnect();
+    }
+  }
+  if (reset) state.position = 0;
+  $('play').textContent = 'Phát';
+  drawPosition(state.position);
+}
+function play() {
+  if (!duration() || state.playback) return;
+  if (state.position >= duration()) state.position = 0;
+  const ctx = audio();
+  void ctx.resume().catch(error => { pause(); status(error.message); });
+  const voices = state.tracks.map(track => connect(ctx, track, state.speed));
+  setMix(voices, state.tracks);
+  const job = { voices, start: ctx.currentTime + 0.025, offset: state.position, speed: state.speed };
+  state.playback = job;
+  for (const { source } of voices) source.start(job.start, job.offset);
+  $('play').textContent = 'Tạm dừng';
+  function tick() {
+    if (state.playback !== job) return;
+    const position = job.offset + Math.max(0, ctx.currentTime - job.start) * job.speed;
+    if (position >= duration()) return pause(true);
+    drawPosition(position);
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+}
+function seek(position) {
+  const playing = Boolean(state.playback);
+  pause();
+  state.position = Math.max(0, Math.min(position, duration()));
+  drawPosition(state.position);
+  if (playing && position < duration()) play();
+}
+function rangeEdit(kind) {
+  const length = state.tracks[0].buffer.length;
+  const start = Math.round(Number($('in').value) * rate);
+  const end = Math.min(length, Math.round(Number($('out').value) * rate));
+  if (kind !== 'reverse' && (!$('in').value || !$('out').value || start < 0 || end <= start || (kind === 'cut' && end - start >= length))) {
+    return status('Chọn một khoảng hợp lệ và giữ lại ít nhất một phần bài nhạc.');
+  }
+  pause(true);
+  let edited;
+  try {
+    edited = state.tracks.map(track => {
+      const old = track.buffer;
+      const frames = kind === 'keep' ? end - start : kind === 'cut' ? length - end + start : length;
+      const next = audio().createBuffer(old.numberOfChannels, frames, rate);
+      for (let ch = 0; ch < old.numberOfChannels; ch++) {
+        const input = old.getChannelData(ch);
+        const output = next.getChannelData(ch);
+        if (kind === 'reverse') {
+          output.set(input);
+          output.reverse();
+        } else if (kind === 'keep') {
+          output.set(input.subarray(start, end));
+        } else {
+          output.set(input.subarray(0, start));
+          output.set(input.subarray(end), start);
+        }
+      }
+      return { ...track, buffer: next };
+    });
+  } catch (error) { return status('Không thể chỉnh đoạn: ' + error.message); }
+  state.history.push(state.tracks);
+  if (state.history.length > 5) state.history.shift();
+  state.tracks = edited;
+  redraw(true);
+  status('');
+}
+async function exportAudio(tracks, suffix, isolated = false) {
+  const speed = state.speed;
+  const snapshot = tracks.map(track => ({ ...track }));
+  try {
+    const ctx = new OfflineAudioContext(2, Math.ceil(snapshot[0].buffer.length / speed), rate);
+    const voices = snapshot.map(track => connect(ctx, track, speed));
+    setMix(voices, snapshot, isolated);
+    for (const { source } of voices) source.start();
+    const buffer = await ctx.startRendering();
+    const bytes = new ArrayBuffer(44 + buffer.length * 4);
+    const view = new DataView(bytes);
+    const ascii = (offset, word) => [...word].forEach((letter, index) => view.setUint8(offset + index, letter.charCodeAt(0)));
+    ascii(0, 'RIFF'); view.setUint32(4, bytes.byteLength - 8, true);
+    ascii(8, 'WAVE'); ascii(12, 'fmt '); view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); view.setUint16(22, 2, true);
+    view.setUint32(24, rate, true); view.setUint32(28, rate * 4, true);
+    view.setUint16(32, 4, true); view.setUint16(34, 16, true);
+    ascii(36, 'data'); view.setUint32(40, bytes.byteLength - 44, true);
+    const left = buffer.getChannelData(0), right = buffer.getChannelData(1);
+    for (let i = 0; i < buffer.length; i++) {
+      view.setInt16(44 + i * 4, Math.max(-1, Math.min(1, left[i])) * 32767, true);
+      view.setInt16(46 + i * 4, Math.max(-1, Math.min(1, right[i])) * 32767, true);
+    }
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName + '-' + suffix + '.wav';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  } catch (error) { status('Không thể xuất WAV: ' + error.message); }
+}
+function progress(message, fraction) {
+  status(message);
+  $('progress').hidden = false;
+  if (Number.isFinite(fraction)) $('progress').value = fraction;
+  else $('progress').removeAttribute('value');
+}
+function consent() {
+  const dialog = $('consent');
+  dialog.returnValue = '';
+  return new Promise(resolve => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'accept'), { once: true });
+    dialog.showModal();
+  });
+}
+async function loadModel() {
+  if (state.modelFile) return state.modelFile;
+  const store = await cache().catch(() => null);
+  const cached = await store?.match(modelKey);
+  if (cached) return cached.blob();
+  if (!await consent()) return null;
+  void navigator.storage?.persist?.().catch(() => {});
+  download = new AbortController();
+  progress('Đang tải mô hình…');
+  const response = await fetch(modelUrl, { signal: download.signal });
+  if (!response.ok || !response.body) throw new Error('Không tải được mô hình (HTTP ' + response.status + ').');
+  const size = Number(response.headers.get('Content-Length'));
+  const reader = response.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.byteLength;
+    progress('Đã tải ' + Math.round(loaded / 1e6) + ' MB', size ? Math.min(1, loaded / size) : undefined);
+  }
+  const blob = new Blob(chunks, { type: 'application/octet-stream' });
+  if (store) {
+    try {
+      await store.put(modelKey, new Response(blob));
+      state.cached = true;
+    } catch {
+      status('Trình duyệt không đủ chỗ lưu mô hình. Dùng tạm cho lần tách này.');
+    }
+  }
+  return blob;
+}
+function runSeparation(modelBlob, buffer) {
+  return new Promise((resolve, reject) => {
+    pending = reject;
+    worker = new Worker('./vendor/worker.js');
+    worker.onerror = event => reject(new Error(event.message || 'Worker AI không khởi động được.'));
+    worker.onmessage = ({ data }) => {
+      if (data.type === 'split progress') {
+        progress('Đang tách nhạc · ' + data.step + '/' + data.total, data.total ? data.step / data.total : undefined);
+      }
+      if (data.type === 'split done') {
+        if (data.error) reject(new Error(data.error.message || String(data.error)));
+        else resolve(data.tracks);
+      }
+    };
+    const channelData = [buffer.getChannelData(0).slice(), buffer.getChannelData(Math.min(1, buffer.numberOfChannels - 1)).slice()];
+    worker.postMessage({ type: 'split', id: 'stem-job', fileName, modelBlob, rawAudio: { channelData, sampleRate: rate } },
+      channelData.map(channel => channel.buffer));
+  });
+}
+$('split').onclick = async () => {
+  if (state.busy || !original) return;
+  cancelled = false;
+  setBusy(true);
+  $('cancel').hidden = false;
+  try {
+    const model = await loadModel();
+    if (!model || cancelled) return;
+    progress(navigator.gpu ? 'Đang khởi động mô hình…' : 'Đang khởi động mô hình. Chạy bằng CPU có thể lâu hơn…');
+    const stems = await runSeparation(model, original);
+    const tracks = ['vocals','drums','bass','other'].map(key => {
+      const { channelData, sampleRate } = stems[key];
+      const buffer = audio().createBuffer(channelData.length, channelData[0].length, sampleRate);
+      channelData.forEach((channel, index) => buffer.copyToChannel(channel, index));
+      return newTrack(key, buffer);
+    });
+    pause(true);
+    state.history = [];
+    state.tracks = tracks;
+    $('preset').value = 'mix';
+    redraw(true);
+    status('Đã tách 4 lớp.');
+  } catch (error) {
+    status(cancelled ? 'Đã hủy tách.' : 'Tách nhạc gặp lỗi: ' + error.message);
+  } finally {
+    worker?.terminate();
+    worker = pending = download = undefined;
+    $('progress').hidden = $('cancel').hidden = true;
+    setBusy(false);
+    await showModel();
+  }
+};
+$('cancel').onclick = () => {
+  cancelled = true;
+  download?.abort();
+  worker?.terminate();
+  pending?.(new Error('Đã hủy.'));
+  status('Đã hủy tách.');
+};
+$('file').onchange = async event => {
+  const file = event.target.files[0];
+  event.target.value = '';
+  if (!file || state.busy) return;
+  setBusy(true);
+  status('Đang đọc bài nhạc…');
+  try {
+    const decoded = await audio().decodeAudioData(await file.arrayBuffer());
+    pause(true);
+    fileName = file.name.replace(/\.[^.]+$/, '');
+    original = decoded;
+    $('song').textContent = file.name;
+    $('fileInfo').textContent = time(decoded.duration) + ' · ' + (decoded.numberOfChannels === 1 ? 'Mono' : 'Stereo');
+    state.speed = 1;
+    state.history = [];
+    $('speed').value = '1';
+    $('preset').value = 'mix';
+    state.tracks = [newTrack('original', original)];
+    redraw(true);
+    status('');
+  } catch { status('Trình duyệt không đọc được file nhạc này. Hãy thử MP3 hoặc WAV.'); }
+  finally { setBusy(false); }
+};
+$('modelFile').onchange = async event => {
+  if (event.target.files[0]) state.modelFile = event.target.files[0];
+  event.target.value = '';
+  await showModel();
+};
+$('clear').onclick = async () => {
+  setBusy(true);
+  try {
+    if (state.cached) await (await cache()).delete(modelKey);
+    state.modelFile = null;
+    status('Đã bỏ mô hình đang dùng.');
+  } catch (error) { status('Không xóa được mô hình: ' + error.message); }
+  finally { state.busy = false; await showModel(); }
+};
+$('play').onclick = () => state.playback ? pause() : play();
+$('stop').onclick = () => pause(true);
+$('seek').oninput = event => seek(Number(event.target.value));
+$('speed').onchange = event => {
+  const wasPlaying = Boolean(state.playback);
+  pause();
+  state.speed = Number(event.target.value);
+  if (wasPlaying) play();
+};
+$('preset').onchange = event => {
+  const preset = event.target.value;
+  for (const track of state.tracks) {
+    track.mute = (preset === 'karaoke' && track.key === 'vocals') || (preset === 'vocal' && track.key !== 'vocals');
+    track.solo = false;
+    track.gain = preset === 'bass' && track.key === 'bass' ? 1.22 : 1;
+    track.pan = 0;
+    track.eq = preset === 'clarity' && track.key === 'vocals' ? 4 : 0;
+  }
+  updateMix();
+  redraw();
+};
+$('keep').onclick = () => rangeEdit('keep');
+$('cut').onclick = () => rangeEdit('cut');
+$('reverse').onclick = () => rangeEdit('reverse');
+$('undo').onclick = () => {
+  if (!state.history.length) return;
+  pause(true);
+  const current = state.tracks;
+  state.tracks = state.history.pop().map((track, index) => ({ ...current[index], buffer: track.buffer }));
+  redraw(true);
+  status('');
+};
+$('export').onclick = () => exportAudio(state.tracks, 'mix');
+void showModel();

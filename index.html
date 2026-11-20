@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mạch Studio — Chỉnh nhạc trên máy</title>
+<link rel="stylesheet" href="./style.css">
+<script type="module" src="./app.js"></script>
+</head>
+<body>
+<header><div class="brand"><span class="mark" aria-hidden="true">▥</span> Mạch Studio</div><span class="local">● Xử lý trên thiết bị</span></header>
+<main>
+<section class="intro"><h1>Chỉnh nhạc</h1><p>Tách vocal, trống, bass và nhạc cụ rồi chỉnh từng lớp trên timeline.</p></section>
+<section class="panel import">
+<div><h2 id="song">Mở một bài nhạc</h2><p id="fileInfo">MP3, WAV hoặc các định dạng trình duyệt hỗ trợ</p></div>
+<div class="actions"><label class="button">Chọn bài nhạc<input id="file" type="file" accept="audio/*,.wav,.mp3" hidden></label><button id="split" class="primary" disabled>Tách bằng AI</button><button id="cancel" hidden>Hủy tách</button></div>
+</section>
+<div id="status" role="status" aria-live="polite"></div><progress id="progress" hidden></progress>
+<section class="panel editor" aria-label="Timeline">
+<div class="toolbar">
+<button id="play" disabled>Phát</button><button id="stop" disabled>Dừng</button>
+<output id="time">0:00 / 0:00</output>
+<label>Tốc độ <select id="speed" disabled><option value=".5">0.5×</option><option value=".75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+<button id="reverse" disabled>Đảo ngược</button>
+<label>Preset <select id="preset" disabled><option value="mix">Bản mix</option><option value="karaoke">Karaoke</option><option value="vocal">Acapella</option><option value="bass">Bass Boost</option><option value="clarity">Vocal rõ hơn</option></select></label>
+<button id="export" disabled>Xuất WAV</button>
+</div>
+<input id="seek" type="range" min="0" max="0" step=".001" value="0" disabled aria-label="Vị trí phát">
+<div id="tracks"><p class="empty">Chọn bài nhạc để xem waveform.</p></div>
+<div class="toolbar trim">
+<label>Bắt đầu (giây) <input id="in" type="number" min="0" step=".01" value="0" disabled></label>
+<label>Kết thúc (giây) <input id="out" type="number" min="0" step=".01" value="0" disabled></label>
+<button id="keep" disabled>Giữ đoạn</button><button id="cut" disabled>Xóa đoạn</button><button id="undo" disabled>Hoàn tác</button>
+</div>
+</section>
+<section class="panel model"><div><h2>Mô hình AI</h2><p id="modelStatus">Đang kiểm tra bộ nhớ…</p></div><div class="actions"><label class="button">Chọn file ONNX<input id="modelFile" type="file" accept=".onnx" hidden></label><button id="clear" disabled>Xóa mô hình đã lưu</button></div></section>
+</main>
+<dialog id="consent"><form method="dialog"><h2>Tải và lưu mô hình AI?</h2><p>HTDemucs cần tải khoảng 175 MB. Trình duyệt sẽ lưu mô hình trên thiết bị để dùng lại. Bài nhạc được xử lý ngay trên máy.</p><p>Dành cho sử dụng cá nhân và nghiên cứu.</p><div class="actions"><button value="cancel" autofocus>Để sau</button><button class="primary" value="accept">Đồng ý tải và lưu</button></div></form></dialog>
+<template id="track"><article class="track"><div class="track-name"></div><div class="wave"><canvas width="960" height="68"></canvas><i></i></div><div class="mix"><button type="button" data-track="mute">Mute</button><button type="button" data-track="solo">Solo</button><label>Âm lượng <input data-track="gain" type="range" min="0" max="1.6" step=".01" value="1"></label><label>Pan <input data-track="pan" type="range" min="-1" max="1" step=".01" value="0"></label><label>EQ <input data-track="eq" type="range" min="-12" max="12" step="1" value="0"></label><button type="button" data-track="wav">WAV</button></div></article></template>
+</body></html>
